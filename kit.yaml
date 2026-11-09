@@ -1,4 +1,5 @@
 name: dpleshakov
 description: OpenCode tools by Dmitry Pleshakov, distributed as a penates kit
 target_hint: ~/.config/opencode
-shared: []
+shared:
+  - AGENTS.md

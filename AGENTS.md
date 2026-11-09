@@ -17,6 +17,8 @@ locks.
 - One capability per item; variants of one capability are separate items,
   replaced by remove + select in one apply.
 - Versions follow semver: major — behavior change, minor — added capability,
-  patch — wording. Add `CHANGELOG.md` to an item when a major update lands.
+  patch — wording. New items start at 0.1.0; while the major version is 0, a
+  breaking change bumps the minor. Add `CHANGELOG.md` to an item when a major
+  update lands.
 - `shared` in `kit.yaml` lists the target files section and json contributions
   may write to; add entries as the first need appears.

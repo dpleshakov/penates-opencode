@@ -1,0 +1,10 @@
+id: writing
+version: 0.1.0
+description: Register and conventions for prose stored in a repository or sent to people
+tags: [skill]
+vars: []
+contributes:
+  - file: SKILL.md
+    to: skills/writing/SKILL.md
+  - section: deliverables.md
+    to: AGENTS.md

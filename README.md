@@ -16,7 +16,11 @@ tool itself.
 
 ## Items
 
-None yet — the kit grows as tools move in.
+- **writing** — register and conventions for prose stored in a repository or sent to
+  people: the skill plus the `Deliverables` rules it owns in the target's `AGENTS.md`.
+  If that file arrives from elsewhere with the section already inside, remove the
+  section before installing the item — penates never writes over content it does not
+  own.
 
 ## License
 
