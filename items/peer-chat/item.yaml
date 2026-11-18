@@ -1,0 +1,16 @@
+id: peer-chat
+version: 0.1.0
+description: Two OpenCode agents in one tmux window exchanging messages typed into each other's composer
+tags: [skill, tmux]
+vars: []
+contributes:
+  - file: SKILL.md
+    to: skills/peer-chat/SKILL.md
+  - file: README.md
+    to: skills/peer-chat/README.md
+  - file: peer-chat
+    to: skills/peer-chat/peer-chat
+  - file: peer-room
+    to: skills/peer-chat/peer-room
+  - file: tests
+    to: skills/peer-chat/tests

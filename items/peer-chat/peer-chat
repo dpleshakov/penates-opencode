@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+# author: Dmitry Pleshakov
+# version: 3.3
+"""Type one peer-chat message into the peer opencode pane of this tmux window.
+
+Run from inside a tmux pane (the sender pane). The target is the other pane of
+the same window that runs opencode; tmux pane addressing does the rest. Two
+control operations reset the peer's context instead of delivering a message:
+`peer-chat compact` summarizes the peer's session in place, `peer-chat
+new-session` puts it on a fresh session that remembers nothing.
+
+States recognised on the peer screen (calibrated against opencode 2.2.5):
+
+  empty   composer box blank or showing the `Ask anything…` placeholder,
+          mode line `Build · …` — the only state the script types into
+  busy    footer shows `esc interrupt` while the agent is working
+  draft   a Build-mode composer holding text that is not the placeholder
+  shell   mode line `Shell` — the peer composer is in `!` shell mode
+  plan    mode line `Plan · …` — the peer pane sits in plan mode
+  unknown anything else (dialog, command menu, different TUI, opencode exited)
+
+The body is typed as bracketed-paste chunks: raw keystrokes would let any `!`
+in the text switch the peer composer into shell mode (reproduced: the typed
+draft is destroyed and the rest executes as a command), and one large event
+can lose text. Chunks are sized to the peer composer's measured width so
+each renders literally — a paste wider than the composer collapses to a
+`[Pasted]` chip whose content cannot be verified on screen. Sizing counts
+characters, not display cells: bodies heavy in wide runes (CJK, emoji) are
+refused rather than mis-delivered. Each chunk ends with a marker
+absent from the message; every chunk is confirmed on screen before the next
+one starts, and the marker is backspaced away and confirmed gone. On any
+mid-body failure the script backspaces exactly what it typed; only a
+verified-clean composer counts as safe to retry.
+
+The control operations are typed differently: their slash command goes in
+as literal keys, because a pasted slash never opens the command menu and
+Enter would then submit the text as a chat message. The names carry only
+lowercase letters, digits and `-`, so literal keys cannot trip a binding
+or a mode switch; each key run is verified against the command menu on
+screen before Enter is sent, and the peer is polled until it settles.
+Both operations need this pane to hold the room's control right
+(@peer-control, granted by `peer-room -c` at creation; without it the
+script refuses before typing anything into the peer).
+
+Exit codes:
+  0    message typed and its submission confirmed
+  1    nothing was left in the peer composer: refused before typing, or typed
+       and then removed again with the removal confirmed; safe to retry
+  2    peer state is not known-clean: submission unconfirmed, or cleanup could
+       not restore the composer; do NOT resend — inspect the peer pane
+  130  interrupted before anything was typed; an interrupt after typing is
+        reported as 1 or 2 through the same cleanup
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+
+MAX_MESSAGE_BYTES = int(os.environ.get("PEER_CHAT_MAX_BYTES", str(16 * 1024)))
+CHUNK_MIN_CHARS = 24  # never let a narrow composer shrink chunks below this
+CHUNK_MAX_CHARS = 120  # pastes above ~130 chars collapse to a `[Pasted]` chip
+CHIP_PREFIX = "[Pasted"  # composer collapses a wrapping paste to this chip
+CHUNK_CONFIRM_TIMEOUT = 3.0  # seconds to wait for one chunk to render
+ACCEPT_TIMEOUT = 10.0  # seconds to wait for the composer to clear after Enter
+ACCEPT_STABLE = 0.5  # a settled state must hold at least this long
+SETTLE_BEFORE_SUBMIT = 0.5  # quiet time between the last chunk and Enter
+POLL_INTERVAL = 0.15
+CLEANUP_BATCH = 64  # backspaces per cleanup batch
+CLEANUP_TIMEOUT = 10.0
+CAPTURE_LINES = 60  # analyzed screen rows; the composer sits at the bottom
+FOOTER_LINES = 3  # rows that may legitimately carry `esc interrupt`
+
+# Control operations: subcommand name -> the slash command it types.
+CONTROL_OPERATIONS = {"compact": "compact", "new-session": "new"}
+MENU_OFFER_TIMEOUT = 3.0  # seconds for the command menu to offer the slash
+COMMAND_IDLE_TIMEOUT = 150.0  # a long compaction runs as an agent turn
+COMMAND_SETTLE_GRACE = 2.0  # busy may appear a moment after the command
+IDLE_STABLE = 0.75  # an idle composer must hold this long after a command
+
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,24}$")
+LABEL_RE = re.compile(r"^chat from [^:]{1,40}:\s*", re.IGNORECASE)
+
+# The composer is a box of `┃` lines. The last box line above the `╹▀…` rule is
+# the mode line (`Build · …`, `Plan · …`, or bare `Shell`); the lines above it
+# are the input area, blank or with a placeholder when empty.
+BOX_RE = re.compile(r"^\s*┃\s*(.*?)\s*$")
+RULE_RE = re.compile(r"^\s*╹(▀+)\s*$")  # the group is the composer width
+MODE_RE = re.compile(r"^(Build|Plan|Shell)\b")
+PLACEHOLDERS = ("Ask anything…", "Run a command…", "Plan anything…")
+BUSY_MARK = "esc interrupt"
+
+# Typable states, keyed for error messages and --check hints.
+STATE_HINTS = {
+    "shell": "press Esc in the peer pane to exit shell mode, then retry",
+    "plan": "switch the peer pane back to build mode (shift+tab) before sending",
+    "draft": "the peer is composing; wait for it to finish and clear its composer",
+}
+
+
+class Refused(Exception):
+    """Nothing was typed, or everything typed was removed again."""
+
+
+class Ambiguous(Exception):
+    """The peer composer is not known-clean; the caller must not resend."""
+
+
+def hint_for(state: str) -> str:
+    """The operator hint for a non-typable peer state, '' when none."""
+    return f"; {STATE_HINTS[state]}" if state in STATE_HINTS else ""
+
+
+def tmux(*args: str) -> str:
+    result = subprocess.run(
+        ["tmux", *args], capture_output=True, text=True, timeout=15
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"tmux {' '.join(args[:3])} failed: {detail}")
+    return result.stdout
+
+
+def capture_lines(pane: str, sh=tmux) -> list[str]:
+    lines = sh("capture-pane", "-p", "-t", pane).splitlines()
+    return [line.rstrip() for line in lines[-CAPTURE_LINES:]]
+
+
+def pane_command(pane: str, sh=tmux) -> str:
+    return sh(
+        "display-message", "-p", "-t", pane, "#{pane_current_command}"
+    ).strip()
+
+
+def pane_tab(pane: str, sh=tmux) -> str:
+    """Active session tab of the pane, or '' when no title is set."""
+    try:
+        return sh("display-message", "-p", "-t", pane, "#{pane_title}").strip()
+    except RuntimeError:
+        return ""
+
+
+def pane_option(pane: str | None, option: str, sh=tmux) -> str:
+    """Value of a pane option set by peer-room ('' when unset)."""
+    if not pane:
+        return ""
+    try:
+        return sh("show-options", "-p", "-v", "-t", pane, option).strip()
+    except RuntimeError:
+        return ""
+
+
+def pane_name(pane: str | None, sh=tmux) -> str:
+    """Room name of a pane, set by peer-room as a pane option ('' unset)."""
+    return pane_option(pane, "@peer-name", sh)
+
+
+def identity(peer: str, sh=tmux) -> tuple[str, str]:
+    """(self name, peer name) of this room, each '' when unknown.
+
+    peer-room records every pane's name as a pane option. This pane also
+    carries PEER_CHAT_NAME as a fallback; the peer's name has none — it is
+    in its pane option or unknown.
+    """
+    self_name = pane_name(os.environ.get("TMUX_PANE", ""), sh)
+    if not self_name:
+        self_name = os.environ.get("PEER_CHAT_NAME", "")
+    return self_name, pane_name(peer, sh)
+
+
+def has_control(sh=tmux) -> bool:
+    """Whether this pane holds this room's peer-control right."""
+    return bool(
+        pane_option(os.environ.get("TMUX_PANE", ""), "@peer-control", sh)
+    )
+
+
+def require_control(peer: str, sh=tmux) -> None:
+    """Raise Refused unless this pane may run control commands on the peer."""
+    if has_control(sh):
+        return
+    if pane_option(peer, "@peer-control", sh):
+        raise Refused(
+            "control commands belong to the peer pane in this room; "
+            "this pane holds no @peer-control"
+        )
+    raise Refused(
+        "control commands need @peer-control on this pane; this room grants "
+        "it to none (recreate the room with peer-room -c, or set it by "
+        "hand: tmux set-option -p -t <pane> @peer-control 1)"
+    )
+
+
+def classify(lines: list[str]) -> tuple[str, str]:
+    """Classify the bottom of a pane screen. Returns (state, detail)."""
+    if any(BUSY_MARK in line for line in lines[-FOOTER_LINES:]):
+        return "busy", "peer agent is working (esc interrupt shown)"
+    rule_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        if RULE_RE.match(lines[index]):
+            rule_index = index
+            break
+    if rule_index is None:
+        return "unknown", "composer rule line not found on the peer screen"
+    if rule_index == 0:
+        return "unknown", "composer mode line missing"
+    mode_match = BOX_RE.match(lines[rule_index - 1])
+    mode_text = mode_match.group(1).strip() if mode_match else ""
+    mode = MODE_RE.match(mode_text)
+    if not mode:
+        return "unknown", f"composer mode line not recognised ({mode_text[:40]!r})"
+    state = mode.group(1)
+    content: list[str] = []
+    index = rule_index - 2
+    while index >= 0:
+        match = BOX_RE.match(lines[index])
+        if not match:
+            break
+        text = match.group(1).strip()
+        if text and not any(text.startswith(p) for p in PLACEHOLDERS):
+            content.append(text)
+        index -= 1
+    if state == "Build":
+        if content:
+            return "draft", " ".join(reversed(content))
+        return "empty", ""
+    detail = {
+        "Shell": "peer composer is in shell mode (!)",
+        "Plan": "peer pane is in plan mode",
+    }[state]
+    if content:
+        detail += f" and holds text: {' '.join(reversed(content))[:80]!r}"
+    return state.lower(), detail
+
+
+def resolve_target(selector: str, expected_command: str, sh=tmux) -> tuple[str, str]:
+    """Return (pane id of the peer, how it was derived), or raise Refused."""
+    sender = os.environ.get("TMUX_PANE", "")
+    if not sender:
+        raise Refused("not inside a tmux pane (TMUX_PANE is unset)")
+    if selector.startswith("%"):
+        command = pane_command(selector, sh)
+        if command != expected_command:
+            raise Refused(
+                f"pane {selector} runs {command!r}, not {expected_command!r}"
+            )
+        return selector, f"explicit --to {selector}"
+    window = sh(
+        "display-message", "-p", "-t", sender, "#{window_id}"
+    ).strip()
+    panes: list[tuple[str, str]] = []
+    for row in sh(
+        "list-panes", "-t", window, "-F", "#{pane_id}|#{pane_current_command}"
+    ).splitlines():
+        pane_id, _, command = row.partition("|")
+        if pane_id and pane_id != sender:
+            panes.append((pane_id, command))
+    matches = [pane for pane, command in panes if command == expected_command]
+    if len(matches) == 1:
+        return matches[0], f"the only other {expected_command!r} pane in {window}"
+    if len(matches) > 1:
+        listed = ", ".join(matches)
+        raise Refused(
+            f"several panes run {expected_command!r} ({listed}); "
+            "pass --to with one pane id"
+        )
+    if len(panes) == 1:
+        raise Refused(
+            f"the other pane runs {panes[0][1]!r}, not {expected_command!r}"
+        )
+    raise Refused(f"no other pane in this window runs {expected_command!r}")
+
+
+def tab_suffix(pane: str | None, sh=tmux) -> str:
+    """Report the peer's active tab, flagging untitled fresh sessions."""
+    if not pane:
+        return ""
+    tab = pane_tab(pane, sh)
+    if not tab:
+        return " (peer active tab: untitled — fresh session)"
+    if not tab.startswith("OC |"):
+        return f" (peer active tab: {tab!r} — no session title, fresh session)"
+    return f" (peer active tab: {tab!r})"
+
+
+def normalize(raw: str, name: str) -> str:
+    line = " ".join(raw.split())
+    while True:
+        match = LABEL_RE.match(line)
+        if not match:
+            break
+        line = line[match.end() :]
+    if not line:
+        raise Refused("chat message is empty")
+    if any(unicodedata.category(char) == "Cc" for char in line):
+        raise Refused("chat message contains a control character")
+    typed = f"Chat from {name}: {line}"
+    if len(typed.encode("utf-8")) > MAX_MESSAGE_BYTES:
+        raise Refused(
+            f"chat message is longer than {MAX_MESSAGE_BYTES} bytes"
+        )
+    return typed
+
+
+def text_chunks(text: str, max_chars: int) -> list[str]:
+    """Split text into chunks short enough to render literally in the peer
+    composer: a paste wider than the box collapses to a `[Pasted]` chip
+    whose content cannot be verified on screen."""
+    max_chars = max(CHUNK_MIN_CHARS, max_chars)
+    chunks: list[str] = []
+    current = ""
+    for token in re.findall(r" ?[^ ]+", text):
+        if len(current) + len(token) <= max_chars:
+            current += token
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(token) <= max_chars:
+            current = token
+            continue
+        for start in range(0, len(token), max_chars):
+            chunks.append(token[start : start + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def probe_marker(text: str) -> str:
+    """A short visible marker that cannot occur in this message."""
+    index = 0
+    while True:
+        marker = f" [peer-check:{index:x}]"
+        if marker not in text:
+            return marker
+        index += 1
+
+
+def composer_width(lines: list[str]) -> int | None:
+    """Width of the composer box, measured from its `╹▀▀…` rule line.
+
+    The box does not always span the pane (a sidebar or transcript can sit
+    beside it), so the pane width alone overestimates it and a chunk sized
+    from it collapses to a `[Pasted]` chip.
+    """
+    for line in reversed(lines):
+        match = RULE_RE.match(line)
+        if match:
+            return len(match.group(1))
+    return None
+
+
+def paste(target: str, text: str, sh=tmux) -> None:
+    """Insert text as a bracketed paste, immune to key bindings."""
+    sh("send-keys", "-t", target, "-l", "--", f"\x1b[200~{text}\x1b[201~")
+
+
+def backspace(target: str, count: int, sh=tmux) -> None:
+    sh("send-keys", "-t", target, *(["BSpace"] * count))
+
+
+def submit(target: str, sh=tmux) -> None:
+    sh("send-keys", "-t", target, "Enter")
+
+
+def squeeze(text: str) -> str:
+    """Whitespace-insensitive form: wrapping cannot break the comparison."""
+    return "".join(text.split())
+
+
+def tail_matches(content: str, expected: str, window: int = 120) -> bool:
+    """Whether the composer content ends with the expected text."""
+    return squeeze(content).endswith(squeeze(expected[-window:]))
+
+
+def peer_state(target: str, sh=tmux) -> tuple[str, str]:
+    return classify(capture_lines(target, sh))
+
+
+def wait_until(deadline: float, predicate) -> bool:
+    """Poll until predicate() holds or the deadline passes."""
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL)
+
+
+def wait_for_empty(target: str, wait_seconds: float, sh=tmux) -> None:
+    """Wait for an idle Build-mode composer, or refuse with the last state."""
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    state, detail = "unknown", ""
+    while True:
+        state, detail = peer_state(target, sh)
+        if state == "empty":
+            return
+        if state in ("shell", "plan", "draft", "unknown"):
+            raise Refused(
+                f"peer composer: {state} ({detail[:100]}){hint_for(state)}"
+            )
+        if time.monotonic() >= deadline:
+            raise Refused(f"peer is still working after {wait_seconds:.0f}s")
+        time.sleep(POLL_INTERVAL)
+
+
+def slash_menu_visible(target: str, name: str, sh=tmux) -> bool:
+    """Whether the composer holds `/<name>` and the command menu offers it.
+
+    A slash typed key by key opens the command menu; the menu row renders
+    as `┃ /name <description>` while the composer row holds the bare
+    `┃  /name`, so a row carrying text after the name is the offer itself.
+    """
+    lines = capture_lines(target, sh)
+    state, content = classify(lines)
+    if state != "draft" or f"/{name}" not in content:
+        return False
+    offer = re.compile(rf"^\s*┃\s*/{re.escape(name)}\s+\S")
+    return any(offer.match(line) for line in lines)
+
+
+def type_slash_command(target: str, name: str, sh=tmux) -> None:
+    """Type `/<name>` as literal keys until the command menu offers it.
+
+    Raises Refused with the draft confirmably removed when the peer screen
+    does not offer the command (e.g. /compact outside a session), and
+    Ambiguous when the removal itself cannot be confirmed.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        raise Refused(f"not a slash command name: {name!r}")
+    sh("send-keys", "-t", target, "-l", "--", f"/{name}")
+    if not wait_until(
+        time.monotonic() + MENU_OFFER_TIMEOUT,
+        lambda: slash_menu_visible(target, name, sh),
+    ):
+        backspace(target, len(name) + 1, sh)
+        if wait_until(
+            time.monotonic() + 1.0, lambda: peer_state(target, sh)[0] == "empty"
+        ):
+            raise Refused(
+                f"the peer screen does not offer /{name} "
+                "(wrong screen state for this command); draft removed"
+            )
+        raise Ambiguous(
+            f"/{name} not offered and the draft could not be confirmed "
+            "removed; inspect the peer pane"
+        )
+
+
+def wait_peer_idle(target: str, timeout: float, sh=tmux) -> str:
+    """Wait for the peer to settle after a control command.
+
+    Returns the settled state ('empty' once idle, or whatever the screen
+    holds at timeout). Compaction runs as an agent turn and may sit in
+    busy for minutes; a fresh session lands on an empty composer at once.
+    """
+    deadline = time.monotonic() + timeout
+    grace_until = time.monotonic() + COMMAND_SETTLE_GRACE
+    stable_since: float | None = None
+    while True:
+        state, _ = peer_state(target, sh)
+        now = time.monotonic()
+        if state == "empty" and now >= grace_until:
+            if stable_since is None:
+                stable_since = now
+            elif now - stable_since >= IDLE_STABLE:
+                return "empty"
+        else:
+            stable_since = None
+        if now > deadline:
+            return state
+        time.sleep(POLL_INTERVAL)
+
+
+def verify_composer(
+    target: str, expected: str, marker: str, want_marker: bool, sh=tmux
+) -> bool:
+    """The composer holds the expected tail, with or without the marker."""
+    state, content = peer_state(target, sh)
+    if state != "draft":
+        return False
+    shown = squeeze(content)
+    if want_marker:
+        return squeeze(marker) in shown and tail_matches(
+            content, expected + marker
+        )
+    return squeeze(marker) not in shown and tail_matches(content, expected)
+
+
+def cleanup_owned(target: str, attempted: str, sh=tmux) -> bool:
+    """Backspace exactly what this send may have left in the composer.
+
+    `attempted` is every character this send might have put there. The
+    composer may show the whole draft or, when it scrolled, only its tail;
+    either way it must match a prefix-and-suffix of `attempted` for the text
+    to be ours. Returns True once the composer is confirmably empty again,
+    False when it holds anything else.
+    """
+    # Removal time scales with the volume: one CLEANUP_BATCH per poll.
+    deadline = (
+        time.monotonic()
+        + CLEANUP_TIMEOUT
+        + len(attempted) / CLEANUP_BATCH * POLL_INTERVAL
+    )
+    squeezed = squeeze(attempted)
+    while time.monotonic() < deadline:
+        state, content = peer_state(target, sh)
+        if state == "empty":
+            return True
+        if state != "draft":
+            return False
+        shown = squeeze(content)
+        if shown.startswith(squeeze(CHIP_PREFIX)):
+            # A paste wider than the composer collapsed to a chip: the text
+            # is ours but invisible. Backspace it all, verifying emptiness.
+            delete = len(attempted)
+        elif squeezed.startswith(shown):
+            delete = 0
+            seen = 0
+            for index, char in enumerate(attempted, start=1):
+                if not char.isspace():
+                    seen += 1
+                if seen == len(shown):
+                    delete = index
+                    break
+        elif squeezed.endswith(shown):
+            delete = len(attempted)  # scrolled: our draft, tail visible only
+        else:
+            return False  # not our text; do not touch it
+        if delete <= 0:
+            return False
+        backspace(target, min(CLEANUP_BATCH, delete), sh)
+        time.sleep(POLL_INTERVAL)
+    return peer_state(target, sh)[0] == "empty"
+
+
+def send_message(target: str, body: str, expected_command: str, sh=tmux) -> None:
+    """Type the body in verified chunks, then submit. On any unconfirmed
+    step it removes what it typed before reporting, so the peer composer is
+    never knowingly left holding this send's text."""
+    marker = probe_marker(body)
+    width = composer_width(capture_lines(target, sh)) or 80
+    budget = max(
+        CHUNK_MIN_CHARS, min(width - 8 - len(marker), CHUNK_MAX_CHARS)
+    )
+    chunks = text_chunks(body, budget)
+    confirmed = ""
+    attempted = ""
+    phase = "precheck"
+    try:
+        for index, chunk in enumerate(chunks):
+            phase = f"chunk {index + 1}/{len(chunks)}"
+            attempted = confirmed + chunk + marker
+            command = pane_command(target, sh)
+            if command != expected_command:
+                raise Refused(
+                    f"peer pane now runs {command!r} mid-send; aborting"
+                )
+            paste(target, chunk + marker, sh)
+            if not wait_until(
+                time.monotonic() + CHUNK_CONFIRM_TIMEOUT,
+                lambda c=chunk: verify_composer(
+                    target, confirmed + c, marker, True, sh
+                ),
+            ):
+                raise Ambiguous(f"{phase} typed but not confirmed on screen")
+            backspace(target, len(marker), sh)
+            if not wait_until(
+                time.monotonic() + CHUNK_CONFIRM_TIMEOUT,
+                lambda a=confirmed + chunk: verify_composer(
+                    target, a, marker, False, sh
+                ),
+            ):
+                raise Ambiguous(f"{phase} marker not confirmably removed")
+            confirmed += chunk
+        phase = "submit"
+        time.sleep(SETTLE_BEFORE_SUBMIT)
+        state, content = peer_state(target, sh)
+        if state != "draft" or not tail_matches(content, confirmed, window=240):
+            raise Ambiguous("composer changed before submit; submit withheld")
+        submit(target, sh)
+        phase = "accept"
+        deadline = time.monotonic() + ACCEPT_TIMEOUT
+        stable_since: float | None = None
+        while True:
+            state, _ = peer_state(target, sh)
+            if state in ("empty", "busy"):
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= ACCEPT_STABLE:
+                    return
+            else:
+                stable_since = None
+            if time.monotonic() > deadline:
+                raise Ambiguous("peer composer did not confirm the submit")
+            time.sleep(POLL_INTERVAL)
+    except BaseException as err:
+        if phase == "precheck":
+            raise
+        if phase == "accept":
+            # Enter was already sent: an empty or busy composer means the
+            # submit probably went through, not that this send cleaned it.
+            try:
+                state, _ = peer_state(target, sh)
+            except Exception:
+                state = "unknown"
+            if state in ("empty", "busy"):
+                raise Ambiguous(
+                    f"{phase}: submit sent, composer {state} — delivery "
+                    "likely but unconfirmed; do not resend"
+                ) from err
+        cleaned = False
+        interrupted_during_cleanup = False
+        try:
+            cleaned = cleanup_owned(target, attempted, sh)
+        except KeyboardInterrupt:
+            interrupted_during_cleanup = True
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            cleaned = False
+        note = "composer cleaned; safe to retry" if cleaned else (
+            "cleanup failed; do not resend — inspect the peer pane "
+            "(Ctrl+U in it clears the draft)"
+        )
+        if interrupted_during_cleanup:
+            raise Ambiguous(f"{phase}: cleanup interrupted; {note}") from err
+        if cleaned:
+            raise Refused(f"{phase}: {note}") from err
+        raise Ambiguous(f"{phase}: {note}") from err
+
+
+def report_error(err: Exception, pane: str | None) -> None:
+    """Print a refusal with its cause: the cause names the actual failure."""
+    cause = f" — {err.__cause__}" if err.__cause__ else ""
+    print(f"peer-chat: {err}{cause}{tab_suffix(pane)}", file=sys.stderr)
+
+
+def run_operation(target: str, operation: str, how: str, wait: float) -> int:
+    """Run a control operation on the peer's session from this pane."""
+    require_control(target)
+    wait_for_empty(target, wait)
+    name = CONTROL_OPERATIONS[operation]
+    try:
+        type_slash_command(target, name)
+        submit(target)
+        state = wait_peer_idle(target, COMMAND_IDLE_TIMEOUT)
+    except KeyboardInterrupt:
+        print(
+            f"peer-chat: interrupted; the peer may hold an unsubmitted "
+            f"/{name} draft — Enter in it runs the command, Ctrl+U clears "
+            f"it{tab_suffix(target)}",
+            file=sys.stderr,
+        )
+        return 2
+    if state != "empty":
+        raise Ambiguous(
+            f"peer is {state} after {COMMAND_IDLE_TIMEOUT:.0f}s — the "
+            "command may still be running; inspect the peer pane"
+        )
+    self_name, peer_name = identity(target)
+    report = f" {target}" + (f" ({peer_name})" if peer_name else "")
+    report += f" as {self_name}" if self_name else ""
+    if operation == "compact":
+        print(f"compacted{report} — its session now holds only the summary")
+    else:
+        print(
+            f"new session for{report} — it remembers nothing; the next "
+            "message must carry the full briefing"
+        )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Send one peer-chat message to the opencode pane beside this "
+            "one, or reset that peer's session (compact, new-session)."
+        )
+    )
+    parser.add_argument(
+        "operation",
+        nargs="?",
+        choices=sorted(CONTROL_OPERATIONS),
+        default=None,
+        help=(
+            "reset the peer's context instead of sending a message: "
+            "'compact' summarizes its session in place, 'new-session' "
+            "puts it on a fresh session that remembers nothing"
+        ),
+    )
+    parser.add_argument(
+        "--to",
+        default="peer",
+        help="'peer' (the other opencode pane) or an explicit pane id like %%5",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="resolve the peer and report its state, both panes' names, "
+        "without typing anything",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=30.0,
+        metavar="SEC",
+        help="seconds to wait for an idle peer before refusing (default 30, 0 off)",
+    )
+    parser.add_argument(
+        "--target-command",
+        default=os.environ.get("PEER_CHAT_TARGET_COMMAND", "opencode"),
+        help="command name the peer pane must run (default: opencode)",
+    )
+    args = parser.parse_args()
+
+    target: str | None = None
+    try:
+        target, how = resolve_target(args.to, args.target_command)
+        if args.operation:
+            if args.check:
+                parser.error("--check and an operation are mutually exclusive")
+            return run_operation(target, args.operation, how, args.wait)
+        if args.check:
+            state, detail = peer_state(target)
+            self_pane = os.environ.get("TMUX_PANE", "?")
+            self_name, peer_name = identity(target)
+            who = self_pane + (f" {self_name}" if self_name else "")
+            if peer_name:
+                who += f" → {target} {peer_name}"
+            print(
+                f"{target}: {state}"
+                + (f" ({detail[:100]})" if detail else "")
+                + f" (resolved as {how}, self {who})"
+                + tab_suffix(target)
+                + hint_for(state)
+            )
+            return 0 if state == "empty" else 1
+        name = os.environ.get("PEER_CHAT_NAME", "")
+        if not NAME_RE.match(name):
+            raise Refused(
+                "sender name unknown; PEER_CHAT_NAME must be set "
+                "(peer-room sets it per pane)"
+            )
+        typed_text = normalize(sys.stdin.read(), name)
+        wait_for_empty(target, args.wait)
+        send_message(target, typed_text, args.target_command)
+        self_name, peer_name = identity(target)
+        report = f"sent to {target}"
+        if peer_name:
+            report += f" ({peer_name})"
+        if self_name:
+            report += f" as {self_name}"
+        print(f"{report} (resolved as {how}){tab_suffix(target)}")
+        return 0
+    except Refused as err:
+        report_error(err, target)
+        return 1
+    except Ambiguous as err:
+        report_error(err, target)
+        return 2
+    except KeyboardInterrupt:
+        print(
+            f"peer-chat: interrupted; nothing left in the peer composer"
+            f"{tab_suffix(target)}",
+            file=sys.stderr,
+        )
+        return 130
+    except (OSError, subprocess.SubprocessError, RuntimeError) as err:
+        print(f"peer-chat: {err}{tab_suffix(target)}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

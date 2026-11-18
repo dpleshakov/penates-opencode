@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# author: Dmitry Pleshakov
+# version: 3.2
+# Manage a two-opencode peer-chat room: enter it, list rooms, close it.
+#
+# usage: peer-room [-d dir] [-n name] [-l name] [-r name] [-c side] [--detached]
+#        peer-room list
+#        peer-room close [-d dir] [-n name]
+#
+#   -d dir     working directory for both panes (default: current dir)
+#   -n name    room name (default: the directory's name, . and : become -)
+#   -l name    left pane sender name (default: alpha)
+#   -r name    right pane sender name (default: beta)
+#   -c side    which pane may run peer-chat control commands on the other
+#              pane: left, right, or both (default: left)
+#   --detached create the room without entering it (for scripts)
+#
+# With no subcommand: create the room when missing, then enter it — a
+# plain attach, or a switch of the current tmux client when run inside
+# tmux. `list` shows every room on this tmux server; `close` kills one
+# and never touches sessions that are not rooms. Each pane runs
+# opencode with the model you pick in that pane's model dialog; models
+# are not set from the command line. A new room opens with the left
+# pane active; each pane's name is recorded as a tmux pane option
+# (@peer-name) for peer-chat to report, and the control side as
+# @peer-control for peer-chat compact/new-session. Mouse mode is
+# enabled for the room.
+set -euo pipefail
+
+MARKER='@peer-room'
+NAME_RE='^[A-Za-z0-9._-]{1,24}$'
+OPENCODE=${OPENCODE_BIN:-opencode}
+
+usage() { sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; }
+
+die() { echo "peer-room: $*" >&2; exit 1; }
+
+CMD=start
+case ${1:-} in
+  list | close) CMD=$1; shift ;;
+esac
+
+DIR=$PWD
+ROOM=
+LEFT_NAME=alpha
+RIGHT_NAME=beta
+CONTROL=left
+DETACHED=0
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -d) [[ $# -ge 2 ]] || die "$1 needs a value"; DIR=$2; shift 2 ;;
+    -n) [[ $# -ge 2 ]] || die "$1 needs a value"; ROOM=$2; shift 2 ;;
+    -l) [[ $# -ge 2 ]] || die "$1 needs a value"; LEFT_NAME=$2; shift 2 ;;
+    -r) [[ $# -ge 2 ]] || die "$1 needs a value"; RIGHT_NAME=$2; shift 2 ;;
+    -c) [[ $# -ge 2 ]] || die "$1 needs a value"; CONTROL=$2; shift 2 ;;
+    --detached) DETACHED=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (see peer-room -h)" ;;
+  esac
+done
+
+if [[ $CMD != start ]]; then
+  [[ $DETACHED == 0 ]] || die "--detached applies only to room creation"
+  [[ $LEFT_NAME == alpha && $RIGHT_NAME == beta ]] \
+    || die "-l/-r apply only to room creation"
+  [[ $CONTROL == left ]] || die "-c applies only to room creation"
+fi
+[[ $CONTROL =~ ^(left|right|both)$ ]] || die "-c must be left, right, or both"
+
+[[ -d $DIR ]] || die "not a directory: $DIR"
+DIR=$(cd "$DIR" && pwd)
+command -v tmux >/dev/null || die "tmux is not installed"
+
+if [[ -n $ROOM ]]; then
+  [[ $ROOM =~ ^[A-Za-z0-9_-]{1,64}$ ]] \
+    || die "invalid room name: $ROOM (allowed: letters, digits, - and _)"
+else
+  ROOM=$(basename "$DIR")
+  ROOM=${ROOM//[.:]/-}
+  [[ -n $ROOM ]] || die "cannot derive a room name from $DIR; pass -n"
+fi
+
+has_session() { tmux has-session -t "=$1" 2>/dev/null; }
+
+marker_of() {
+  # the @peer-room marker of an exact session name, empty when unset
+  tmux list-sessions -F '#{session_name}'$'\t''#{@peer-room}' 2>/dev/null \
+    | awk -F '\t' -v n="$1" '$1 == n { print $2 }'
+}
+
+list_rooms() {
+  local rows=() name marker attached created agents dir sdir control state when row
+  local w_name=4 w_agents=7 w_dir=9 w_control=7
+  # awk filters sessions down to rooms (marker starts with "dir=") and
+  # keeps empty marker fields from collapsing under IFS tab-splitting
+  while IFS=$'\t' read -r name marker attached created; do
+    dir=${marker#dir=}; dir=${dir%% names=*}
+    agents=${marker##* names=}; agents=${agents%% control=*}; agents=${agents//,/\/}
+    if [[ $marker == *" control="* ]]; then
+      control=${marker##* control=}
+    else
+      control=-
+    fi
+    sdir=${dir/#"$HOME"/'~'}
+    if [[ $attached == 0 ]]; then state=-; else state=attached; fi
+    when=$(date -d "@$created" '+%b %d %H:%M' 2>/dev/null) || when='?'
+    rows+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s' \
+      "$name" "$agents" "$control" "$sdir" "$state" "$when")")
+    w_name=$(( ${#name} > w_name ? ${#name} : w_name ))
+    w_agents=$(( ${#agents} > w_agents ? ${#agents} : w_agents ))
+    w_dir=$(( ${#sdir} > w_dir ? ${#sdir} : w_dir ))
+  done < <(tmux list-sessions -F \
+    '#{session_name}'$'\t''#{@peer-room}'$'\t''#{session_attached}'$'\t''#{session_created}' \
+    2>/dev/null | awk -F'\t' '$2 ~ /^dir=/ {print $1 "\t" $2 "\t" $3 "\t" $4}')
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    echo "no rooms"
+    return 0
+  fi
+  printf '%-*s  %-*s  %-*s  %-*s  %-8s  %s\n' \
+    "$w_name" NAME "$w_agents" AGENTS "$w_control" CONTROL "$w_dir" DIRECTORY ATTACHED STARTED
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r name agents control sdir state when <<< "$row"
+    printf '%-*s  %-*s  %-*s  %-*s  %-8s  %s\n' \
+      "$w_name" "$name" "$w_agents" "$agents" "$w_control" "$control" "$w_dir" "$sdir" "$state" "$when"
+  done
+}
+
+close_room() {
+  local target=$ROOM rooms=() name marker
+  if has_session "$target"; then
+    [[ -n $(marker_of "$target") ]] \
+      || die "session '$target' exists but is not a peer-room; close does not touch it"
+  else
+    while IFS=$'\t' read -r name; do
+      rooms+=("$name")
+    done < <(tmux list-sessions -F \
+      '#{session_name}'$'\t''#{@peer-room}' 2>/dev/null \
+      | awk -F'\t' '$2 ~ /^dir=/ {print $1}')
+    if [[ ${#rooms[@]} -eq 1 ]]; then
+      target=${rooms[0]}
+      echo "no room '$ROOM'; closing the only room: $target"
+    elif [[ ${#rooms[@]} -eq 0 ]]; then
+      die "no rooms"
+    else
+      list_rooms
+      die "no room '$ROOM'; several exist — pass -n <name>"
+    fi
+  fi
+  tmux kill-session -t "=$target"
+  echo "room '$target' closed"
+  echo "an agent mid-turn may linger without a screen: pgrep -af opencode"
+}
+
+launch() {
+  local pane=$1 name=$2
+  tmux set-option -p -t "$pane" @peer-name "$name"
+  tmux send-keys -t "$pane" \
+    "env PEER_CHAT_NAME=$name PATH=\"\$HOME/.local/bin:\$PATH\" $OPENCODE" Enter
+}
+
+create_room() {
+  local name
+  for name in "$LEFT_NAME" "$RIGHT_NAME"; do
+    [[ $name == *=* ]] && die "model specs were removed: the opencode 2.x TUI has no --model flag; pick the model in each pane's model dialog"
+    [[ $name =~ $NAME_RE ]] || die "invalid pane name: $name"
+  done
+  command -v "$OPENCODE" >/dev/null || die "opencode is not on PATH"
+  tmux new-session -d -s "$ROOM" -c "$DIR" -x 200 -y 50
+  tmux set-option -t "$ROOM" mouse on
+  tmux set-option -t "$ROOM" "$MARKER" "dir=$DIR names=$LEFT_NAME,$RIGHT_NAME control=$CONTROL"
+  tmux split-window -h -t "$ROOM" -c "$DIR"
+  local panes=()
+  mapfile -t panes < <(tmux list-panes -t "$ROOM" -F '#{pane_id}')
+  launch "${panes[0]}" "$LEFT_NAME"
+  launch "${panes[1]}" "$RIGHT_NAME"
+  case $CONTROL in
+    left)  tmux set-option -p -t "${panes[0]}" @peer-control 1 ;;
+    right) tmux set-option -p -t "${panes[1]}" @peer-control 1 ;;
+    both)  tmux set-option -p -t "${panes[0]}" @peer-control 1
+           tmux set-option -p -t "${panes[1]}" @peer-control 1 ;;
+  esac
+  tmux select-pane -t "${panes[0]}"
+}
+
+enter_room() {
+  local fresh=$1
+  if [[ -n ${TMUX:-} ]]; then
+    local prev
+    prev=$(tmux display-message -p '#S')
+    echo "switched this client to room '$ROOM'; session '$prev' keeps running"
+    echo "back to it with: tmux attach -t $prev"
+    tmux switch-client -t "=$ROOM"
+    if [[ $fresh == fresh ]]; then
+      tmux display-message -d 6000 \
+        "new room '$ROOM' — pick a model in each pane before the first prompt"
+    else
+      tmux display-message -d 5000 \
+        "room '$ROOM'; previous session '$prev' — back with tmux attach -t $prev"
+    fi
+  else
+    if [[ $fresh == fresh ]]; then
+      # display-message needs a client; attach takes the terminal a moment
+      # later, so the hint goes out from the background just after it lands
+      ( sleep 1
+        tmux display-message -d 6000 -t "=$ROOM" \
+          "new room '$ROOM' — pick a model in each pane before the first prompt"
+      ) >/dev/null 2>&1 &
+    fi
+    tmux attach -t "=$ROOM"
+    echo "room '$ROOM' keeps running; back with: peer-room -n $ROOM"
+    echo "close it with: peer-room close -n $ROOM"
+  fi
+}
+
+case $CMD in
+  list)
+    list_rooms
+    ;;
+  close)
+    close_room
+    ;;
+  start)
+    if has_session "$ROOM"; then
+      if [[ -z $(marker_of "$ROOM") ]]; then
+        die "tmux session '$ROOM' already exists and is not a peer-room; start with -n <name>"
+      fi
+      if [[ $DETACHED == 1 ]]; then
+        echo "room '$ROOM' already running: $(marker_of "$ROOM")"
+        exit 0
+      fi
+      echo "existing room '$ROOM': $(marker_of "$ROOM")"
+      enter_room existing
+      exit 0
+    fi
+    create_room
+    echo "room '$ROOM' ready (left: $LEFT_NAME — give the task here, right: $RIGHT_NAME; control: $CONTROL)"
+    echo "Pick a model in each pane before its first prompt; until picked, a pane mirrors the last model picked anywhere."
+    echo "Give the task to exactly one pane; leave the other idle until a 'Chat from' message arrives."
+    if [[ $DETACHED == 1 ]]; then
+      echo "enter with: peer-room -n $ROOM"
+      exit 0
+    fi
+    enter_room fresh
+    ;;
+esac
